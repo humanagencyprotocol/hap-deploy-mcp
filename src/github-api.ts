@@ -135,13 +135,22 @@ export async function findRunSince(
   sinceMs: number,
   timeoutMs = 12_000,
 ): Promise<WorkflowRun | null> {
+  // Tolerance for clock skew between this machine and GitHub's timestamps.
+  // Without it a run created microseconds before our local `Date.now()` reading
+  // is missed entirely.
+  const SKEW_MS = 5_000;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const runs = await listRuns(repo, workflow, 10);
-    const match = runs.find(
-      r => r.event === 'workflow_dispatch' && Date.parse(r.created_at) >= sinceMs - 5_000,
+    const candidates = runs.filter(
+      r => r.event === 'workflow_dispatch' && Date.parse(r.created_at) >= sinceMs - SKEW_MS,
     );
-    if (match) return match;
+    // Exactly one candidate is an identification. Two or more is a coincidence
+    // — a concurrent dispatch of the same workflow — and picking the first
+    // would silently attribute someone else's run to this receipt. Report
+    // nothing rather than something wrong.
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length > 1) return null;
     await new Promise(r => setTimeout(r, 2_000));
   }
   return null;
