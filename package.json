@@ -1,0 +1,41 @@
+{
+  "name": "@humanagencyp/deploy-mcp",
+  "version": "0.1.0",
+  "description": "Deploy MCP server — run deployment pipelines under bounded human authority (HAP)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "deploy-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --outDir dist --clean",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "npm run build",
+    "release:patch": "npm version patch && git push --follow-tags",
+    "release:minor": "npm version minor && git push --follow-tags"
+  },
+  "keywords": [
+    "mcp",
+    "deploy",
+    "github-actions",
+    "hap",
+    "ai-agents"
+  ],
+  "author": "Andreas Schadauer",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/humanagencyprotocol/hap-deploy-mcp.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "tsup": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
