@@ -1,23 +1,29 @@
 # @humanagencyp/deploy-mcp
 
-Deploy MCP server — run deployment pipelines under bounded human authority.
+Deploy MCP server — make already-built software live, under bounded human authority.
 
 Implements the executor side of the [Human Agency Protocol](https://humanagencyprotocol.org)
-`deploy@0.6` profile. Backend: **GitHub Actions**.
+`deploy@0.7` profile. Backend: **GitHub Actions**.
 
 ## What it does
 
-Exposes deployment as gated tools so an agent can ship software **only** with a
-signed receipt behind it. It does not decide whether a deploy is allowed — that
-is the Gatekeeper's job, and then the pipeline's.
+Exposes releasing as gated tools so an agent can put software in front of real
+users **only** with a signed receipt behind it. It does not decide whether a
+release is allowed — that is the Gatekeeper's job, and then the pipeline's.
+
+**The gated action is a release, not a build.** Building harms nobody: a preview
+at a URL nobody visits has no consequence. Serving it does. So this server never
+builds — it activates a build that already exists, which means a human can
+*open it and look* before approving, and no rebuild can diverge from what was
+approved.
 
 | Tool | Kind | |
 |---|---|---|
+| `list_deployments` | read | builds that can be released, **with their URLs** |
+| `get_deployment` | read | one build, with URL and state |
 | `resolve_ref` | read | branch/tag → commit SHA |
-| `list_deployments` | read | recent workflow runs |
-| `get_deployment` | read | one run |
 | `list_environments` | read | the repo's real environments |
-| `deploy` | consequential | dispatch a pipeline for one commit |
+| `release` | consequential | make an existing build live |
 
 ## Setup
 
@@ -33,26 +39,52 @@ Fine-grained, scoped to **one repository**:
 | Environments: read | list environments for the authorization wizard |
 | Contents: read | resolve a branch to a commit |
 
-**Not** `Contents: write`. This server ships commits that already exist; it never
-authors them.
+**Not** `Contents: write`. This server releases builds that already exist; it
+never authors or builds anything.
 
 ## Two properties that are easy to lose
 
-**1. `deploy` declares `receipt_id`.** That declaration is what makes a Suveren
+**1. `release` declares `receipt_id`.** That declaration is what makes a Suveren
 gateway inject the receipt it just minted. Remove it and the pipeline has
-nothing to verify — the chain quietly degrades to an unproven deploy. The tool
+nothing to verify — the chain quietly degrades to an unproven release. The tool
 refuses to dispatch when the field is missing, so the failure is loud.
 
-**2. A commit is required, not a branch.** `deploy` rejects `main`. A receipt
-binds one commit; authorising "deploy main" would authorise whatever `main`
-happens to be when the action finally runs, which may not be what was reviewed.
-Call `resolve_ref` first.
+**2. A build URL is required, not a commit or branch.** `release` rejects
+anything that is not a URL. The receipt binds that exact build — the same bytes
+a human inspected. Call `list_deployments` first.
+
+Deployment URLs come from GitHub's Deployments API, which hosts with a GitHub
+integration (Vercel, Netlify, Render) populate with `environment_url`. **So this
+server never needs the host's credentials** — GitHub already knows the address,
+and that one value identifies the artifact, shows the human what they are
+approving, and is what the host's promote command accepts.
 
 ## The pipeline must verify
 
 Dispatching is not the control point — anyone with repository write access can
 dispatch a workflow. **The workflow itself must check the receipt** before
-releasing anything:
+serving anything:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_url: { required: true }
+      receipt_id:     { required: true }
+      environment:    { required: true }
+
+jobs:
+  verify:            # signature, action is a release, freshness,
+                     # and that the receipt BINDS THIS BUILD
+    ...
+  release:
+    needs: verify
+    steps:
+      - run: vercel promote "${{ inputs.deployment_url }}" --token "$VERCEL_TOKEN"
+```
+
+Nothing is built here. `promote` re-points production at bytes that already
+exist, so what goes live is exactly what was inspected.
 
 ```yaml
 on:

@@ -156,6 +156,72 @@ export async function findRunSince(
   return null;
 }
 
+// ─── Deployments (the artifacts that can be released) ───────────────────────
+
+export interface DeploymentRecord {
+  id: number;
+  sha: string;
+  environment: string;
+  created_at: string;
+  /** The immutable per-deployment URL. Null until the host reports success. */
+  url: string | null;
+  state: string | null;
+}
+
+/**
+ * List deployments with their current status.
+ *
+ * Reads GitHub's Deployments API rather than workflow runs, because the thing
+ * being released is an ARTIFACT, not a pipeline execution. Hosts with a GitHub
+ * integration (Vercel, Netlify, Render) publish a deployment status carrying
+ * `environment_url` — the immutable per-deployment address.
+ *
+ * That one value is doing three jobs: it identifies the artifact, it is what a
+ * human opens to inspect what they are approving, and it is what the host's
+ * promote command accepts. It also means this connector never needs the host's
+ * credentials — GitHub already knows.
+ *
+ * Costs one status request per deployment; the list is deliberately short.
+ */
+export async function listDeployments(
+  repo: string,
+  environment?: string,
+  limit = 10,
+): Promise<DeploymentRecord[]> {
+  const qs = new URLSearchParams({ per_page: String(limit) });
+  if (environment) qs.set('environment', environment);
+  const raw = await gh<Array<{ id: number; sha: string; environment: string; created_at: string }>>(
+    `/repos/${assertRepo(repo)}/deployments?${qs}`,
+  );
+  return Promise.all(raw.map(async d => {
+    const statuses = await gh<Array<{ state: string; environment_url?: string }>>(
+      `/repos/${assertRepo(repo)}/deployments/${d.id}/statuses?per_page=1`,
+    ).catch(() => []);
+    const latest = statuses[0];
+    return {
+      id: d.id,
+      sha: d.sha,
+      environment: d.environment,
+      created_at: d.created_at,
+      url: latest?.environment_url ?? null,
+      state: latest?.state ?? null,
+    };
+  }));
+}
+
+export async function getDeployment(repo: string, id: number): Promise<DeploymentRecord> {
+  const d = await gh<{ id: number; sha: string; environment: string; created_at: string }>(
+    `/repos/${assertRepo(repo)}/deployments/${id}`,
+  );
+  const statuses = await gh<Array<{ state: string; environment_url?: string }>>(
+    `/repos/${assertRepo(repo)}/deployments/${id}/statuses?per_page=1`,
+  ).catch(() => []);
+  return {
+    id: d.id, sha: d.sha, environment: d.environment, created_at: d.created_at,
+    url: statuses[0]?.environment_url ?? null, state: statuses[0]?.state ?? null,
+  };
+}
+
 // ─── Environments ────────────────────────────────────────────────────────────
 
 export interface Environment {
