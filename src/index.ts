@@ -107,7 +107,7 @@ server.tool(
 
 server.tool(
   'release',
-  'Make an already-built deployment live for real users. Requires a receipt: the pipeline verifies it before anything is served. Call list_deployments first — you release a specific build, identified by its URL, not a commit.',
+  'Make an already-built deployment live for real users. Requires a receipt: the pipeline verifies it before anything is served. Call list_deployments first — you release a specific build, identified by its URL. Supply the source commit it was built from: that is what the receipt binds, and what the released page displays, so a reader can check the two against each other.',
   {
     repo: z.string().describe('Repository as owner/name'),
     workflow: z.string().describe('Pipeline that performs the release, e.g. deploy-website.yml'),
@@ -115,6 +115,14 @@ server.tool(
     deployment_url: z
       .string()
       .describe('Immutable URL of the build to make live, from list_deployments. This is what the human inspects and what the receipt binds.'),
+    commit: z
+      .string()
+      .describe(
+        'Source commit this build was produced from (full 40-char sha). THIS is what the receipt binds. ' +
+        'The deployment URL identifies the bytes but is assigned after they exist, so a page can never ' +
+        'carry it; the source commit is known before the build and is already shown on the released page, ' +
+        'which is what lets a reader tie the page to an approval without any account access.',
+      ),
     branch: z
       .string()
       .optional()
@@ -123,7 +131,7 @@ server.tool(
     // agent — anything it passes is overwritten by the real one.
     receipt_id: z.string().optional().describe('Injected by the gateway after the receipt is issued'),
   },
-  async ({ repo, workflow, environment, deployment_url, branch, receipt_id }) => {
+  async ({ repo, workflow, environment, deployment_url, commit, branch, receipt_id }) => {
     try {
       if (!receipt_id) {
         // Ungated call, or the schema declaration was lost in a refactor.
@@ -139,19 +147,30 @@ server.tool(
         ));
       }
 
+      if (!/^[0-9a-f]{40}$/i.test(commit)) {
+        // A short sha binds a prefix, and a prefix is not an identity — nor is
+        // it what the released page displays in full.
+        return fail(new Error(
+          `"${commit}" is not a full 40-character commit sha. The receipt binds this value exactly.`,
+        ));
+      }
+
       const dispatchedAt = Date.now();
       await gh.dispatchWorkflow({
         repo,
         workflow,
         ref: branch ?? 'main',
-        inputs: { deployment_url, receipt_id, environment },
+        // `commit` reaches the pipeline so it can refuse to promote an artifact
+        // that was NOT built from the approved source — the one gap that binding
+        // a commit rather than the bytes would otherwise leave open.
+        inputs: { deployment_url, receipt_id, environment, commit },
       });
 
       const run = await gh.findRunSince(repo, workflow, dispatchedAt);
       const where = run ? `\nRun ${run.id}: ${run.html_url}` : '\nRun id not yet visible.';
       return ok(
         `Releasing ${deployment_url} to ${environment}.${where}\n` +
-        `The pipeline verifies receipt ${receipt_id} binds this exact build before serving it.`,
+        `The pipeline verifies receipt ${receipt_id} binds commit ${commit.slice(0, 7)}, and that this build came from it, before serving anything.`,
       );
     } catch (e) {
       return fail(e);
