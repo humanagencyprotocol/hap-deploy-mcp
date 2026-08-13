@@ -11,6 +11,8 @@
     "build": "tsup src/index.ts --format esm --outDir dist --clean",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run build",
     "release:patch": "npm version patch && git push --follow-tags",
     "release:minor": "npm version minor && git push --follow-tags"
@@ -36,6 +38,7 @@
     "@types/node": "^26.1.2",
     "tsup": "^8.5.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^2.0.0"
   }
 }

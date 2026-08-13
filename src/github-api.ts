@@ -222,6 +222,87 @@ export async function getDeployment(repo: string, id: number): Promise<Deploymen
   };
 }
 
+// ─── Stamped source commit (what the built page actually displays) ─────────
+
+const STAMPED_COMMIT_RE = /commit\/([0-9a-f]{40})/;
+const STAMPED_COMMIT_FETCH_TIMEOUT_MS = 5_000;
+
+/**
+ * Pull the source commit out of a built page's "Built from <sha>" footer
+ * link. CI pipelines (this repo's `build-website.yml` included) stamp
+ * VERCEL_GIT_COMMIT_SHA — the last non-build commit — into that link when
+ * the page is built. It is what a reader sees and what a public receipt
+ * lookup checks against.
+ *
+ * That stamped value is NOT always the same as a deployment's `sha` field
+ * (GitHub's Deployments API reports the ref that triggered the build). When
+ * the repo head is a build-artifact commit — a dist-only merge tip, say —
+ * the trigger sha and the source sha diverge, and a receipt bound to the
+ * trigger sha certifies a commit the page never displays. Exported
+ * separately from {@link fetchStampedCommit} so extraction can be unit
+ * tested against fixed HTML, with no network involved.
+ */
+export function extractStampedCommit(html: string): string | null {
+  const m = STAMPED_COMMIT_RE.exec(html);
+  return m ? m[1] : null;
+}
+
+/**
+ * Fetch a deployment URL and read the commit its "Built from" footer
+ * displays.
+ *
+ * Returns null on ANY failure to obtain a trustworthy value — network
+ * error, timeout, non-2xx response, or a page with no matching link.
+ * Callers must treat null as "unknown, could not confirm", never as a
+ * silent pass: the whole point of this check is that absence of the value
+ * must not let a release through unchecked.
+ */
+export async function fetchStampedCommit(
+  url: string,
+  timeoutMs = STAMPED_COMMIT_FETCH_TIMEOUT_MS,
+): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    const html = await res.text();
+    return extractStampedCommit(html);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export type StampedCommitCheck =
+  | { status: 'match'; stamped: string }
+  | { status: 'mismatch'; stamped: string }
+  // Fetch failed/timed out, or the page had no matching "Built from" link.
+  // Kept as one outcome, not two, because `release` treats both the same
+  // way: refuse. Absence of the value must not pass unchecked.
+  | { status: 'unconfirmed' };
+
+/**
+ * The fail-closed guard `release` runs before dispatching: does the page at
+ * `url` display `expectedCommit`?
+ *
+ * Pulled out of the tool handler so it is a plain async function — testable
+ * against a mocked `fetch` without pulling in the MCP server (which starts
+ * a stdio transport as a side effect of module load).
+ */
+export async function checkStampedCommit(
+  url: string,
+  expectedCommit: string,
+  timeoutMs?: number,
+): Promise<StampedCommitCheck> {
+  const stamped = await fetchStampedCommit(url, timeoutMs);
+  if (stamped == null) return { status: 'unconfirmed' };
+  return stamped.toLowerCase() === expectedCommit.toLowerCase()
+    ? { status: 'match', stamped }
+    : { status: 'mismatch', stamped };
+}
+
 // ─── Environments ────────────────────────────────────────────────────────────
 
 export interface Environment {

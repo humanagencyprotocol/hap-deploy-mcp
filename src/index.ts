@@ -38,6 +38,42 @@ const fail = (e: unknown) => ({
 });
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 
+/**
+ * Attach the source commit a deployment's built page actually displays.
+ *
+ * `sha` on a `DeploymentRecord` is GitHub's trigger ref — the commit the
+ * pipeline ran at, which can be a build-artifact commit (a dist-only merge
+ * tip). The page itself stamps a different value at build time: the last
+ * non-build source commit. `release` binds — and the public receipt lookup
+ * checks against — the STAMPED value, not the trigger sha. This is the one
+ * place a caller can see both before proposing a release, so a mismatch
+ * gets caught here rather than at `release` time (which is fail-closed but
+ * only runs after a receipt already exists).
+ */
+async function withStampedCommit(d: gh.DeploymentRecord) {
+  if (!d.url) {
+    return {
+      ...d,
+      stampedSourceCommit: null,
+      stampedSourceCommitNote:
+        'No deployment URL yet — nothing to fetch. Once one appears, call get_deployment again ' +
+        'before proposing a release: `sha` alone is not reliable evidence of the source commit.',
+    };
+  }
+  const stamped = await gh.fetchStampedCommit(d.url);
+  const note = stamped == null
+    ? `Could not read a stamped source commit from ${d.url} (fetch failed, or no "Built from <sha>" ` +
+      `link matching /commit\\/[0-9a-f]{40}/ was found). Do not assume "sha" is safe to bind instead — ` +
+      `open the URL yourself and confirm the commit before calling release, which will refuse the same way.`
+    : stamped === d.sha
+      ? `Matches "sha" — the trigger commit and the page's stamped source commit are the same here. ` +
+        `Either value is safe to bind as release.commit.`
+      : `Differs from "sha" (${d.sha.slice(0, 7)}): the page was built from ${stamped.slice(0, 7)}, not ` +
+        `the trigger commit. THIS is the value release.commit must carry — the receipt binds what the ` +
+        `released page displays, and release will refuse "${d.sha.slice(0, 7)}" as a mismatch.`;
+  return { ...d, stampedSourceCommit: stamped, stampedSourceCommitNote: note };
+}
+
 // ─── Reads ───────────────────────────────────────────────────────────────────
 
 server.tool(
@@ -59,7 +95,8 @@ server.tool(
 
 server.tool(
   'list_deployments',
-  'List deployments and their URLs — the candidates that can be released. Each carries the immutable address of that exact build, which is what a human opens to see what they would be approving.',
+  'List deployments and their URLs — the candidates that can be released. Each carries the immutable address of that exact build, which is what a human opens to see what they would be approving. ' +
+    'The `sha` shown here is the trigger commit, not necessarily what the built page displays or what release binds — for a build-artifact repo head these can diverge. This call does not fetch every page to check (that cost scales with the list), so before proposing a release call get_deployment on the chosen id and use its `stampedSourceCommit` field.',
   {
     repo: z.string().describe('Repository as owner/name'),
     environment: z.string().optional().describe('Filter by environment'),
@@ -76,14 +113,19 @@ server.tool(
 
 server.tool(
   'get_deployment',
-  'Get one deployment by id, including its URL and current state.',
+  'Get one deployment by id, including its URL, current state, and `stampedSourceCommit` — the source commit ' +
+    'its built page actually displays (fetched and read from the page\'s "Built from" link). Use ' +
+    '`stampedSourceCommit`, not `sha`, as release.commit whenever `stampedSourceCommitNote` says they differ: ' +
+    'the receipt must bind the commit the released page displays, and `sha` is only the trigger ref that ' +
+    'started the build, which can be a build-artifact commit.',
   {
     repo: z.string().describe('Repository as owner/name'),
     deployment_id: z.number().describe('Deployment id from list_deployments'),
   },
   async ({ repo, deployment_id }) => {
     try {
-      return ok(JSON.stringify(await gh.getDeployment(repo, deployment_id), null, 2));
+      const deployment = await gh.getDeployment(repo, deployment_id);
+      return ok(JSON.stringify(await withStampedCommit(deployment), null, 2));
     } catch (e) {
       return fail(e);
     }
@@ -107,7 +149,9 @@ server.tool(
 
 server.tool(
   'release',
-  'Make an already-built deployment live for real users. Requires a receipt: the pipeline verifies it before anything is served. Call list_deployments first — you release a specific build, identified by its URL. Supply the source commit it was built from: that is what the receipt binds, and what the released page displays, so a reader can check the two against each other.',
+  'Make an already-built deployment live for real users. Requires a receipt: the pipeline verifies it before anything is served. Call list_deployments first — you release a specific build, identified by its URL. ' +
+    'Supply the source commit it was built from: that is what the receipt binds, and what the released page displays, so a reader can check the two against each other. ' +
+    'Get that value from get_deployment\'s `stampedSourceCommit`, not from a repo\'s HEAD/trigger sha — when the head is a build-artifact commit the two diverge, and this tool independently fetches deployment_url and refuses (fail-closed) if the commit you supplied is not what the page displays.',
   {
     repo: z.string().describe('Repository as owner/name'),
     workflow: z.string().describe('Pipeline that performs the release, e.g. deploy-website.yml'),
@@ -152,6 +196,34 @@ server.tool(
         // it what the released page displays in full.
         return fail(new Error(
           `"${commit}" is not a full 40-character commit sha. The receipt binds this value exactly.`,
+        ));
+      }
+
+      // Fail-closed source-commit guard. This runs AFTER the receipt already
+      // exists — it cannot run earlier, since it needs a live deployment_url
+      // to fetch — so its job is narrow but load-bearing: stop a receipt that
+      // is already minted from going live bound to the wrong commit. A
+      // receipt for `commit` is worthless if the page it activates displays
+      // a different one; the public receipt lookup checks the page, not the
+      // dispatch input.
+      const check = await gh.checkStampedCommit(deployment_url, commit);
+      if (check.status === 'unconfirmed') {
+        return fail(new Error(
+          `Refusing to release: could not confirm what commit ${deployment_url} was built from. ` +
+          `Checked: fetched the page over HTTPS and looked for a "Built from <sha>" link matching ` +
+          `/commit\\/[0-9a-f]{40}/ in its HTML — the fetch failed, timed out, or no such link was found. ` +
+          `An unreadable page is not evidence that "${commit}" is the right commit to bind; the absence ` +
+          `of a stamped value must not pass unchecked. Open ${deployment_url} yourself and confirm the ` +
+          `commit before retrying.`,
+        ));
+      }
+      if (check.status === 'mismatch') {
+        return fail(new Error(
+          `Refusing to release: ${deployment_url} was built from ${check.stamped}, but commit "${commit}" ` +
+          `was supplied to bind the receipt. The receipt would certify a commit the released page does not ` +
+          `display — the released page's "Built from" link shows ${check.stamped}, not ${commit}. Use ` +
+          `${check.stamped} as the "commit" argument (get_deployment reports it as stampedSourceCommit) and ` +
+          `retry; nothing was dispatched.`,
         ));
       }
 
