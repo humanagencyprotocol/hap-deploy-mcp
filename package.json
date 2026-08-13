@@ -1,7 +1,7 @@
 {
   "name": "@humanagencyp/deploy-mcp",
-  "version": "0.3.0",
-  "description": "Deploy MCP server \u2014 make already-built software live under bounded human authority (HAP)",
+  "version": "0.4.0",
+  "description": "Deploy MCP server — make already-built software live under bounded human authority (HAP)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
