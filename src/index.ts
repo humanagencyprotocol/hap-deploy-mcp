@@ -50,28 +50,60 @@ const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
  * gets caught here rather than at `release` time (which is fail-closed but
  * only runs after a receipt already exists).
  */
-async function withStampedCommit(d: gh.DeploymentRecord) {
-  if (!d.url) {
-    return {
-      ...d,
-      stampedSourceCommit: null,
-      stampedSourceCommitNote:
-        'No deployment URL yet — nothing to fetch. Once one appears, call get_deployment again ' +
-        'before proposing a release: `sha` alone is not reliable evidence of the source commit.',
-    };
+async function withProvenance(repo: string, d: gh.DeploymentRecord) {
+  // Git is the authority: digest of what goes live + the source commit,
+  // derived from history by the build workflow's own rule. No page fetch,
+  // no host credentials, works for a private staged build.
+  let provenance: gh.ArtifactProvenance | null = null;
+  let provenanceError: string | null = null;
+  try {
+    provenance = await gh.resolveArtifact(repo, d.sha, gh.artifactPathFromEnv());
+  } catch (e) {
+    provenanceError = e instanceof Error ? e.message : String(e);
   }
-  const stamped = await gh.fetchStampedCommit(d.url);
-  const note = stamped == null
-    ? `Could not read a stamped source commit from ${d.url} (fetch failed, or no "Built from <sha>" ` +
-      `link matching /commit\\/[0-9a-f]{40}/ was found). Do not assume "sha" is safe to bind instead — ` +
-      `open the URL yourself and confirm the commit before calling release, which will refuse the same way.`
-    : stamped === d.sha
-      ? `Matches "sha" — the trigger commit and the page's stamped source commit are the same here. ` +
-        `Either value is safe to bind as release.commit.`
-      : `Differs from "sha" (${d.sha.slice(0, 7)}): the page was built from ${stamped.slice(0, 7)}, not ` +
-        `the trigger commit. THIS is the value release.commit must carry — the receipt binds what the ` +
-        `released page displays, and release will refuse "${d.sha.slice(0, 7)}" as a mismatch.`;
-  return { ...d, stampedSourceCommit: stamped, stampedSourceCommitNote: note };
+
+  // The page footer is a cross-check, not the gate: read it when reachable,
+  // report agreement or contradiction, and say plainly when it is unreadable.
+  const stamped = d.url ? await gh.fetchStampedCommit(d.url) : null;
+  let stampedNote: string;
+  if (!d.url) {
+    stampedNote = 'No deployment URL yet — nothing to cross-check.';
+  } else if (stamped == null) {
+    stampedNote =
+      `Could not read a "Built from <sha>" link from ${d.url} (unreachable, private, or no such link). ` +
+      'Not needed: release binds the git-derived sourceCommit below. Open the URL yourself if you want to inspect the build.';
+  } else if (provenance && stamped.toLowerCase() === provenance.sourceCommit.toLowerCase()) {
+    stampedNote = 'The page footer agrees with the git-derived sourceCommit.';
+  } else if (provenance) {
+    stampedNote =
+      `CONTRADICTION: the page footer names ${stamped.slice(0, 7)} but git history says the artifact was built ` +
+      `from ${provenance.sourceCommit.slice(0, 7)}. release will refuse this build until that is explained.`;
+  } else {
+    stampedNote = `The page footer names ${stamped.slice(0, 7)}; git-derived provenance is unavailable (see provenanceError).`;
+  }
+
+  const sourceNote = provenance
+    ? provenance.sourceCommit === d.sha
+      ? 'sourceCommit equals the trigger sha: this commit was deployed directly.'
+      : `sourceCommit differs from the trigger sha (${d.sha.slice(0, 7)}): the deployed commit is a build artifact ` +
+        `recording ${provenance.sourceCommit.slice(0, 7)} as its source. Use sourceCommit as release.commit; ` +
+        `release refuses the trigger sha.`
+    : `Could not derive provenance from git: ${provenanceError}. release will refuse this build.`;
+
+  return {
+    ...d,
+    ...(provenance ?? {
+      artifactDigest: null,
+      digestKind: null,
+      artifactPath: gh.artifactPathFromEnv(),
+      sourceCommit: null,
+      triggerCommit: d.sha,
+    }),
+    provenanceError,
+    sourceCommitNote: sourceNote,
+    stampedSourceCommit: stamped,
+    stampedSourceCommitNote: stampedNote,
+  };
 }
 
 // ─── Reads ───────────────────────────────────────────────────────────────────
@@ -113,11 +145,11 @@ server.tool(
 
 server.tool(
   'get_deployment',
-  'Get one deployment by id, including its URL, current state, and `stampedSourceCommit` — the source commit ' +
-    'its built page actually displays (fetched and read from the page\'s "Built from" link). Use ' +
-    '`stampedSourceCommit`, not `sha`, as release.commit whenever `stampedSourceCommitNote` says they differ: ' +
-    'the receipt must bind the commit the released page displays, and `sha` is only the trigger ref that ' +
-    'started the build, which can be a build-artifact commit.',
+  'Get one deployment by id with its provenance derived from git: `sourceCommit` (the commit the artifact was ' +
+    'built from — use THIS as release.commit, never `sha`, which is only the trigger ref and may be a build-artifact ' +
+    'commit) and `artifactDigest` (git tree sha; `digestKind` says whether it digests the served bytes or the source). ' +
+    'Neither needs the page to be reachable. `stampedSourceCommit` is the page footer\'s value when readable — a ' +
+    'cross-check that can only refuse, never the gate. Read `sourceCommitNote` before proposing.',
   {
     repo: z.string().describe('Repository as owner/name'),
     deployment_id: z.number().describe('Deployment id from list_deployments'),
@@ -125,7 +157,7 @@ server.tool(
   async ({ repo, deployment_id }) => {
     try {
       const deployment = await gh.getDeployment(repo, deployment_id);
-      return ok(JSON.stringify(await withStampedCommit(deployment), null, 2));
+      return ok(JSON.stringify(await withProvenance(repo, deployment), null, 2));
     } catch (e) {
       return fail(e);
     }
@@ -151,7 +183,8 @@ server.tool(
   'release',
   'Make an already-built deployment live for real users. Requires a receipt: the pipeline verifies it before anything is served. Call list_deployments first — you release a specific build, identified by its URL. ' +
     'Supply the source commit it was built from: that is what the receipt binds, and what the released page displays, so a reader can check the two against each other. ' +
-    'Get that value from get_deployment\'s `stampedSourceCommit`, not from a repo\'s HEAD/trigger sha — when the head is a build-artifact commit the two diverge, and this tool independently fetches deployment_url and refuses (fail-closed) if the commit you supplied is not what the page displays.',
+    'Get that value from get_deployment\'s `sourceCommit` (derived from git history), not from a repo\'s HEAD/trigger sha — when the head is a build-artifact commit the two diverge. ' +
+    'This tool re-derives the source commit from git itself and refuses (fail-closed) if the commit you supplied differs, or if the page footer, when readable, names a different one.',
   {
     repo: z.string().describe('Repository as owner/name'),
     workflow: z.string().describe('Pipeline that performs the release, e.g. deploy-website.yml'),
@@ -200,30 +233,48 @@ server.tool(
       }
 
       // Fail-closed source-commit guard. This runs AFTER the receipt already
-      // exists — it cannot run earlier, since it needs a live deployment_url
-      // to fetch — so its job is narrow but load-bearing: stop a receipt that
-      // is already minted from going live bound to the wrong commit. A
-      // receipt for `commit` is worthless if the page it activates displays
-      // a different one; the public receipt lookup checks the page, not the
-      // dispatch input.
-      const check = await gh.checkStampedCommit(deployment_url, commit);
-      if (check.status === 'unconfirmed') {
+      // exists, so its job is narrow but load-bearing: stop a receipt that is
+      // already minted from going live bound to the wrong commit.
+      //
+      // Git is the authority. The deployment URL is resolved back to its
+      // deployment, the source commit is re-derived from history (the build
+      // workflow's own rule), and `commit` must match it. The page footer,
+      // when readable, is a cross-check that can only refuse — an unreadable
+      // page (a private staged build) no longer blocks anything, because the
+      // derivation never needed it.
+      const deployment = await gh.findDeploymentByUrl(repo, deployment_url);
+      if (!deployment) {
         return fail(new Error(
-          `Refusing to release: could not confirm what commit ${deployment_url} was built from. ` +
-          `Checked: fetched the page over HTTPS and looked for a "Built from <sha>" link matching ` +
-          `/commit\\/[0-9a-f]{40}/ in its HTML — the fetch failed, timed out, or no such link was found. ` +
-          `An unreadable page is not evidence that "${commit}" is the right commit to bind; the absence ` +
-          `of a stamped value must not pass unchecked. Open ${deployment_url} yourself and confirm the ` +
-          `commit before retrying.`,
+          `Refusing to release: ${deployment_url} does not belong to any recent deployment of ${repo}. ` +
+          'Use list_deployments and pass a URL from there; nothing was dispatched.',
         ));
       }
-      if (check.status === 'mismatch') {
+      let provenance: gh.ArtifactProvenance;
+      try {
+        provenance = await gh.resolveArtifact(repo, deployment.sha, gh.artifactPathFromEnv());
+      } catch (e) {
         return fail(new Error(
-          `Refusing to release: ${deployment_url} was built from ${check.stamped}, but commit "${commit}" ` +
-          `was supplied to bind the receipt. The receipt would certify a commit the released page does not ` +
-          `display — the released page's "Built from" link shows ${check.stamped}, not ${commit}. Use ` +
-          `${check.stamped} as the "commit" argument (get_deployment reports it as stampedSourceCommit) and ` +
-          `retry; nothing was dispatched.`,
+          `Refusing to release: could not derive from git which commit ${deployment_url} was built from ` +
+          `(${e instanceof Error ? e.message : String(e)}). An underivable source is not evidence that ` +
+          `"${commit}" is the right commit to bind; nothing was dispatched.`,
+        ));
+      }
+      const stamped = await gh.fetchStampedCommit(deployment_url);
+      const verdict = gh.checkSourceCommit({ supplied: commit, derived: provenance.sourceCommit, stamped });
+      if (verdict.status === 'mismatch') {
+        return fail(new Error(
+          `Refusing to release: git history says ${deployment_url} was built from ${verdict.derived}, but ` +
+          `commit "${commit}" was supplied to bind the receipt. The receipt would certify a commit the ` +
+          `artifact was not built from. Use ${verdict.derived} as the "commit" argument (get_deployment ` +
+          `reports it as sourceCommit) and retry; nothing was dispatched.`,
+        ));
+      }
+      if (verdict.status === 'page-contradicts') {
+        return fail(new Error(
+          `Refusing to release: git history and the supplied commit agree on ${commit.slice(0, 7)}, but the ` +
+          `page at ${deployment_url} displays "Built from ${verdict.stamped.slice(0, 7)}". A footer that ` +
+          `disagrees with git means the build is not what its history says, or the footer is wrong; neither ` +
+          `may go live. Nothing was dispatched.`,
         ));
       }
 

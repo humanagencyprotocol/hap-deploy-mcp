@@ -20,7 +20,7 @@ approved.
 | Tool | Kind | |
 |---|---|---|
 | `list_deployments` | read | builds that can be released, **with their URLs** |
-| `get_deployment` | read | one build, with URL and state |
+| `get_deployment` | read | one build, with URL, state, and git-derived provenance (`sourceCommit`, `artifactDigest`) |
 | `resolve_ref` | read | branch/tag → commit SHA |
 | `list_environments` | read | the repo's real environments |
 | `release` | consequential | make an existing build live |
@@ -29,6 +29,7 @@ approved.
 
 ```
 GITHUB_TOKEN=<fine-grained token>
+HAP_DEPLOY_ARTIFACT_PATH=website/dist   # optional — see "What the receipt binds"
 ```
 
 Fine-grained, scoped to **one repository**:
@@ -58,6 +59,34 @@ integration (Vercel, Netlify, Render) populate with `environment_url`. **So this
 server never needs the host's credentials** — GitHub already knows the address,
 and that one value identifies the artifact, shows the human what they are
 approving, and is what the host's promote command accepts.
+
+## What the receipt binds, and how the release checks it
+
+The receipt binds the **source commit** the build came from — the value the
+released page shows in its footer, so a reader can tie the page to an approval
+without any account. GitHub's Deployments API reports only the *trigger* sha,
+and for a repository that commits its built artifact those differ: the trigger
+is the artifact commit, the source is the commit before it. Binding the trigger
+sha would certify a commit the page never displays.
+
+`get_deployment` therefore derives provenance **from git history**, by the same
+rule a build workflow uses to stamp the page (the last commit that touched
+anything outside the artifact directory):
+
+| Field | Meaning |
+|---|---|
+| `sourceCommit` | what to pass as `release.commit` |
+| `artifactDigest` | git tree sha — `digestKind: artifact-tree` digests the served bytes when `HAP_DEPLOY_ARTIFACT_PATH` names a committed directory the host serves as-is; `source-tree` (path unset, host builds) digests the source, not what is served |
+| `stampedSourceCommit` | the page footer's value, when the page is reachable |
+
+`release` re-derives `sourceCommit` itself and **refuses** if the supplied commit
+differs. The footer is a cross-check that can only refuse — a reachable page
+naming a different commit blocks the release — never the gate. So a staged
+build behind SSO or a password releases normally; nothing here needs to fetch
+it. Two things it does not do: it does not prove the artifact commit was
+authored by the official build (an attestation does that), and it does not
+verify repository, environment or pipeline (those live in the receipt's private
+execution context — see the protocol's forward ledger).
 
 ## The pipeline must verify
 
