@@ -322,3 +322,190 @@ export async function listEnvironments(repo: string): Promise<Environment[]> {
   );
   return data.environments ?? [];
 }
+
+// ─── Artifact provenance from git (no page fetch, no host credentials) ──────
+
+/**
+ * What a release actually binds should be the bytes that go live, and bytes
+ * have a digest. For a repository whose served artifact is COMMITTED (the
+ * host runs no build — it serves a checked-in directory as-is), that digest
+ * already exists: the git tree sha of that directory at the deployed commit.
+ * It is a Merkle hash over exactly the served files, computable from the
+ * GitHub API alone.
+ *
+ * The same walk yields the SOURCE commit — the last commit on the deployed
+ * commit's history that touched anything outside the artifact directory —
+ * by the very rule the build workflow uses to stamp the page
+ * (`git log -1 -- . ':(exclude)<artifact>'`). Deriving it here means the
+ * release guard no longer depends on fetching the page: the footer becomes
+ * a cross-check when reachable, not the gate.
+ *
+ * Without an artifact path the host builds from the commit itself; the only
+ * digest available is the commit's root tree — a digest of the SOURCE, not
+ * of the served bytes. `digestKind` says which, so nobody reads one as the
+ * other.
+ */
+
+export interface ArtifactProvenance {
+  /** Git tree sha — see `digestKind` for what it is a digest OF. */
+  artifactDigest: string;
+  /**
+   * `artifact-tree`: tree of the committed artifact directory — a digest of
+   * the served bytes. `source-tree`: root tree of the deployed commit — a
+   * digest of the source the host built from, not of what it serves.
+   */
+  digestKind: 'artifact-tree' | 'source-tree';
+  /** The artifact directory, or null when the host builds. */
+  artifactPath: string | null;
+  /** The commit the artifact was built from, derived from git history. */
+  sourceCommit: string;
+  /** The commit that triggered the deployment (the artifact commit, when one exists). */
+  triggerCommit: string;
+}
+
+/**
+ * HAP_DEPLOY_ARTIFACT_PATH — repository-relative directory the host serves
+ * as-is (e.g. `website/dist`). Unset means the host builds from source.
+ * Normalised: no leading `./` or `/`, no trailing `/`.
+ */
+export function artifactPathFromEnv(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env.HAP_DEPLOY_ARTIFACT_PATH?.trim();
+  if (!raw) return null;
+  const norm = raw.replace(/^(\.\/|\/)+/, '').replace(/\/+$/, '');
+  if (!norm || norm.includes('..')) {
+    throw new Error(`HAP_DEPLOY_ARTIFACT_PATH "${raw}" is not a plain repository-relative directory`);
+  }
+  return norm;
+}
+
+/** True when `filename` lies outside the artifact directory. Exported for tests. */
+export function isOutsideArtifact(filename: string, artifactPath: string): boolean {
+  return filename !== artifactPath && !filename.startsWith(artifactPath + '/');
+}
+
+/**
+ * The build workflow's rule, applied to a commit list newest-first: the
+ * first commit that touched anything outside the artifact directory is the
+ * source. Returns null if none of the given commits qualifies. Exported so
+ * the rule is unit-tested against fixed data, no network.
+ */
+export function firstSourceCommit(
+  commits: Array<{ sha: string; files: Array<{ filename: string }> }>,
+  artifactPath: string,
+): string | null {
+  for (const c of commits) {
+    if (c.files.some(f => isOutsideArtifact(f.filename, artifactPath))) return c.sha;
+  }
+  return null;
+}
+
+/** How many commits back to look for the source. Artifact commits stack only on manual reruns. */
+const SOURCE_SEARCH_DEPTH = 30;
+
+export async function resolveArtifact(
+  repo: string,
+  sha: string,
+  artifactPath: string | null,
+): Promise<ArtifactProvenance> {
+  const r = assertRepo(repo);
+  const commit = await gh<{ sha: string; tree: { sha: string } }>(`/repos/${r}/git/commits/${sha}`);
+
+  if (!artifactPath) {
+    return {
+      artifactDigest: commit.tree.sha,
+      digestKind: 'source-tree',
+      artifactPath: null,
+      sourceCommit: commit.sha,
+      triggerCommit: commit.sha,
+    };
+  }
+
+  // Walk the tree down the artifact path. Each hop is one API call; a
+  // missing segment means the deployed commit does not contain the artifact.
+  let treeSha = commit.tree.sha;
+  for (const segment of artifactPath.split('/')) {
+    const tree = await gh<{ tree: Array<{ path: string; type: string; sha: string }> }>(
+      `/repos/${r}/git/trees/${treeSha}`,
+    );
+    const entry = tree.tree.find(e => e.path === segment && e.type === 'tree');
+    if (!entry) {
+      throw new Error(
+        `Artifact path "${artifactPath}" not found at ${sha.slice(0, 7)} (missing "${segment}"). ` +
+          'Either HAP_DEPLOY_ARTIFACT_PATH is wrong or this commit carries no artifact.',
+      );
+    }
+    treeSha = entry.sha;
+  }
+
+  // Source commit: newest-first history from the deployed commit, first one
+  // that touched anything outside the artifact directory.
+  const history = await gh<Array<{ sha: string }>>(
+    `/repos/${r}/commits?sha=${sha}&per_page=${SOURCE_SEARCH_DEPTH}`,
+  );
+  const withFiles: Array<{ sha: string; files: Array<{ filename: string }> }> = [];
+  for (const h of history) {
+    const detail = await gh<{ sha: string; files?: Array<{ filename: string }> }>(
+      `/repos/${r}/commits/${h.sha}`,
+    );
+    withFiles.push({ sha: detail.sha, files: detail.files ?? [] });
+    // Stop as soon as the rule resolves — usually after one or two commits.
+    if (firstSourceCommit(withFiles, artifactPath)) break;
+  }
+  const sourceCommit = firstSourceCommit(withFiles, artifactPath);
+  if (!sourceCommit) {
+    throw new Error(
+      `Could not find a source commit within ${SOURCE_SEARCH_DEPTH} commits of ${sha.slice(0, 7)}: ` +
+        `every one of them touched only "${artifactPath}".`,
+    );
+  }
+
+  return {
+    artifactDigest: treeSha,
+    digestKind: 'artifact-tree',
+    artifactPath,
+    sourceCommit,
+    triggerCommit: commit.sha,
+  };
+}
+
+/** Resolve a deployment URL back to the deployment that owns it. */
+export async function findDeploymentByUrl(repo: string, url: string): Promise<DeploymentRecord | null> {
+  const wanted = url.replace(/\/+$/, '');
+  const candidates = await listDeployments(repo, undefined, 30);
+  return candidates.find(d => d.url && d.url.replace(/\/+$/, '') === wanted) ?? null;
+}
+
+export type SourceCommitVerdict =
+  | { status: 'ok'; pageNote: string }
+  | { status: 'mismatch'; derived: string }
+  | { status: 'page-contradicts'; stamped: string };
+
+/**
+ * The release-time decision, pure so it is tested against fixed inputs.
+ *
+ * Git is the authority: `supplied` must equal the git-derived source commit.
+ * The page's stamped commit, when readable, is a cross-check that may only
+ * REFUSE — a page that names a different commit than git does means the
+ * footer is lying or the artifact is not what git says, and neither should
+ * go live. An unreadable page is not a failure any more: the derivation did
+ * not need it.
+ */
+export function checkSourceCommit(args: {
+  supplied: string;
+  derived: string;
+  stamped: string | null;
+}): SourceCommitVerdict {
+  const supplied = args.supplied.toLowerCase();
+  if (supplied !== args.derived.toLowerCase()) {
+    return { status: 'mismatch', derived: args.derived };
+  }
+  if (args.stamped && args.stamped.toLowerCase() !== supplied) {
+    return { status: 'page-contradicts', stamped: args.stamped };
+  }
+  return {
+    status: 'ok',
+    pageNote: args.stamped
+      ? 'The page footer agrees.'
+      : 'The page footer could not be read (private build?); git history is the authority here.',
+  };
+}
