@@ -90,11 +90,12 @@ describe('resolveArtifact over the GitHub API', () => {
     return calls;
   }
 
-  it('committed artifact: digest = tree of the artifact dir, source = derived by the rule', async () => {
+  it('committed artifact: digest from the trailer, tree sha as cross-check, source = derived by the rule', async () => {
     const ROOT = 'root'.padEnd(40, '0');
     const WEBSITE = 'web'.padEnd(40, '0');
+    const DIGEST = 'sha256:' + 'ab'.repeat(32);
     const calls = stubApi({
-      [`/repos/o/r/git/commits/${ART}`]: { sha: ART, tree: { sha: ROOT } },
+      [`/repos/o/r/git/commits/${ART}`]: { sha: ART, tree: { sha: ROOT }, message: `build: website artifact from 7909995\n\nArtifact-Digest: ${DIGEST}\nArtifact-Root: website/dist\n` },
       [`/repos/o/r/git/trees/${ROOT}`]: { tree: [{ path: 'website', type: 'tree', sha: WEBSITE }, { path: 'README.md', type: 'blob', sha: 'x' }] },
       [`/repos/o/r/git/trees/${WEBSITE}`]: { tree: [{ path: 'dist', type: 'tree', sha: DIST_TREE }] },
       [`/repos/o/r/commits?sha=${ART}`]: [{ sha: ART }, { sha: SRC }],
@@ -104,8 +105,9 @@ describe('resolveArtifact over the GitHub API', () => {
 
     const p = await resolveArtifact('o/r', ART, 'website/dist');
     expect(p).toEqual({
-      artifactDigest: DIST_TREE,
-      digestKind: 'artifact-tree',
+      artifactDigest: DIGEST,
+      digestKind: 'served-bytes',
+      treeSha: DIST_TREE,
       artifactPath: 'website/dist',
       sourceCommit: SRC,
       triggerCommit: ART,
@@ -114,17 +116,35 @@ describe('resolveArtifact over the GitHub API', () => {
     expect(calls.filter(c => c.startsWith('/repos/o/r/commits/'))).toHaveLength(2);
   });
 
-  it('no artifact path: digest is the root tree and is labelled source-tree', async () => {
+  it('no artifact path: no artifact digest, labelled source; the tree sha is only a cross-check', async () => {
     const ROOT = 'root'.padEnd(40, '0');
     stubApi({ [`/repos/o/r/git/commits/${SRC}`]: { sha: SRC, tree: { sha: ROOT } } });
     const p = await resolveArtifact('o/r', SRC, null);
     expect(p).toEqual({
-      artifactDigest: ROOT,
-      digestKind: 'source-tree',
+      artifactDigest: null,
+      digestKind: 'source',
+      treeSha: ROOT,
       artifactPath: null,
       sourceCommit: SRC,
       triggerCommit: SRC,
     });
+  });
+
+  it('an artifact commit without a trailer reports no digest — the pipeline will refuse it, not guess', async () => {
+    const ROOT = 'root'.padEnd(40, '0');
+    const WEBSITE = 'web'.padEnd(40, '0');
+    stubApi({
+      [`/repos/o/r/git/commits/${ART}`]: { sha: ART, tree: { sha: ROOT }, message: 'build: website artifact from 7909995' },
+      [`/repos/o/r/git/trees/${ROOT}`]: { tree: [{ path: 'website', type: 'tree', sha: WEBSITE }] },
+      [`/repos/o/r/git/trees/${WEBSITE}`]: { tree: [{ path: 'dist', type: 'tree', sha: DIST_TREE }] },
+      [`/repos/o/r/commits?sha=${ART}`]: [{ sha: ART }, { sha: SRC }],
+      [`/repos/o/r/commits/${ART}`]: { sha: ART, files: [{ filename: 'website/dist/index.html' }] },
+      [`/repos/o/r/commits/${SRC}`]: { sha: SRC, files: [{ filename: 'README.md' }] },
+    });
+    const p = await resolveArtifact('o/r', ART, 'website/dist');
+    expect(p.artifactDigest).toBeNull();
+    expect(p.digestKind).toBe('served-bytes');
+    expect(p.treeSha).toBe(DIST_TREE);
   });
 
   it('artifact path missing at that commit → throws (never a guessed digest)', async () => {

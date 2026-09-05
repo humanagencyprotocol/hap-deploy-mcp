@@ -95,10 +95,20 @@ async function withProvenance(repo: string, d: gh.DeploymentRecord) {
     ...(provenance ?? {
       artifactDigest: null,
       digestKind: null,
+      treeSha: null,
       artifactPath: gh.artifactPathFromEnv(),
       sourceCommit: null,
       triggerCommit: d.sha,
     }),
+    artifactDigestNote: provenance
+      ? provenance.artifactDigest
+        ? 'sha256 over the artifact\'s file manifest, from the artifact commit\'s Artifact-Digest trailer. ' +
+          'The release pipeline recomputes it from the files and verifies the build attestation over it.'
+        : provenance.digestKind === 'source'
+          ? 'No artifact directory configured (HAP_DEPLOY_ARTIFACT_PATH): the host builds from source, so only the source commit can be identified.'
+          : 'The artifact commit carries no Artifact-Digest trailer — built before the build workflow wrote one. ' +
+            'The release pipeline will hash the files itself, but the build attestation it requires will not exist; rebuild first.'
+      : null,
     provenanceError,
     sourceCommitNote: sourceNote,
     stampedSourceCommit: stamped,
@@ -286,7 +296,10 @@ server.tool(
         // `commit` reaches the pipeline so it can refuse to promote an artifact
         // that was NOT built from the approved source — the one gap that binding
         // a commit rather than the bytes would otherwise leave open.
-        inputs: { deployment_url, receipt_id, environment, commit },
+        // `artifact_commit` is the commit whose committed files ARE the build;
+        // the pipeline's verify job checks it out, hashes website/dist, and
+        // verifies the build attestation over that digest.
+        inputs: { deployment_url, receipt_id, environment, commit, artifact_commit: deployment.sha },
       });
 
       const run = await gh.findRunSince(repo, workflow, dispatchedAt);
