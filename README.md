@@ -76,7 +76,7 @@ anything outside the artifact directory):
 | Field | Meaning |
 |---|---|
 | `sourceCommit` | what to pass as `release.commit` |
-| `artifactDigest` | git tree sha — `digestKind: artifact-tree` digests the served bytes when `HAP_DEPLOY_ARTIFACT_PATH` names a committed directory the host serves as-is; `source-tree` (path unset, host builds) digests the source, not what is served |
+| `artifactDigest` | `sha256:<hex>` over the artifact's file manifest — every file under the artifact directory, sorted by path, one `sha256  path` line each, then sha256 over the lines. Anyone holding the files can recompute it with `sha256sum`. Read from the artifact commit's `Artifact-Digest:` trailer (the build workflow writes it); the release pipeline recomputes it from the files and verifies the build's signed attestation over it. `digestKind: served-bytes` when `HAP_DEPLOY_ARTIFACT_PATH` names the committed directory; `source` when the host builds and only the source commit can be identified |
 | `stampedSourceCommit` | the page footer's value, when the page is reachable |
 
 `release` re-derives `sourceCommit` itself and **refuses** if the supplied commit

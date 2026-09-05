@@ -6,6 +6,10 @@
  * pass its own token would have routed around the whole point.
  */
 
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
+import { createHash } from 'node:crypto';
+
 const API_BASE = 'https://api.github.com';
 const API_VERSION = '2022-11-28';
 
@@ -347,14 +351,23 @@ export async function listEnvironments(repo: string): Promise<Environment[]> {
  */
 
 export interface ArtifactProvenance {
-  /** Git tree sha — see `digestKind` for what it is a digest OF. */
-  artifactDigest: string;
   /**
-   * `artifact-tree`: tree of the committed artifact directory — a digest of
-   * the served bytes. `source-tree`: root tree of the deployed commit — a
-   * digest of the source the host built from, not of what it serves.
+   * The artifact digest a release binds: `sha256:<hex>` over the file
+   * manifest (doc/deploy-digest-binding-proposal.md §3.1), read from the
+   * artifact commit's `Artifact-Digest:` trailer. Reproducible by anyone
+   * holding the files, with sha256sum alone; the release workflow recomputes
+   * it from the files rather than trusting this value. Null when the commit
+   * carries no trailer (built before the build workflow wrote one).
    */
-  digestKind: 'artifact-tree' | 'source-tree';
+  artifactDigest: string | null;
+  /**
+   * `served-bytes`: the digest covers the committed artifact directory — the
+   * bytes the host serves. `source`: no artifact directory is configured, the
+   * host builds from this commit, and only the source can be identified.
+   */
+  digestKind: 'served-bytes' | 'source';
+  /** Git tree sha of the artifact directory (or root) — a git-internal cross-check, not the digest. */
+  treeSha: string;
   /** The artifact directory, or null when the host builds. */
   artifactPath: string | null;
   /** The commit the artifact was built from, derived from git history. */
@@ -408,12 +421,13 @@ export async function resolveArtifact(
   artifactPath: string | null,
 ): Promise<ArtifactProvenance> {
   const r = assertRepo(repo);
-  const commit = await gh<{ sha: string; tree: { sha: string } }>(`/repos/${r}/git/commits/${sha}`);
+  const commit = await gh<{ sha: string; tree: { sha: string }; message?: string }>(`/repos/${r}/git/commits/${sha}`);
 
   if (!artifactPath) {
     return {
-      artifactDigest: commit.tree.sha,
-      digestKind: 'source-tree',
+      artifactDigest: null,
+      digestKind: 'source',
+      treeSha: commit.tree.sha,
       artifactPath: null,
       sourceCommit: commit.sha,
       triggerCommit: commit.sha,
@@ -459,13 +473,63 @@ export async function resolveArtifact(
     );
   }
 
+  const trailers = parseArtifactTrailers(commit.message ?? '');
   return {
-    artifactDigest: treeSha,
-    digestKind: 'artifact-tree',
+    artifactDigest: trailers.artifactDigest,
+    digestKind: 'served-bytes',
+    treeSha,
     artifactPath,
     sourceCommit,
     triggerCommit: commit.sha,
   };
+}
+
+// ─── Artifact digest (doc/deploy-digest-binding-proposal.md §3.1) ───────────
+
+/**
+ * Trailers the build workflow writes on an artifact commit. A pointer, not
+ * evidence: the release workflow recomputes the digest from the files.
+ */
+export function parseArtifactTrailers(message: string): {
+  artifactDigest: string | null;
+  artifactRoot: string | null;
+  sourceCommit: string | null;
+} {
+  const get = (key: string): string | null => {
+    const m = new RegExp(`^${key}:[ \\t]*(\\S+)[ \\t]*$`, 'm').exec(message);
+    return m ? m[1] : null;
+  };
+  const digest = get('Artifact-Digest');
+  return {
+    artifactDigest: digest && /^sha256:[0-9a-f]{64}$/.test(digest) ? digest : null,
+    artifactRoot: get('Artifact-Root'),
+    sourceCommit: get('Source-Commit'),
+  };
+}
+
+/**
+ * Reference implementation of the digest, byte-for-byte what the build and
+ * release workflows compute with `find | sort | xargs sha256sum | sha256sum`:
+ * every regular file under `root`, sorted by relative path BYTEWISE (so
+ * `.well-known/` sorts before `assets/`), one `<sha256>  <path>\n` line each;
+ * the digest is sha256 over those lines. Used by tests to pin parity with the
+ * shell, and available to adapters for targets that expose files directly.
+ */
+export function manifestDigestOfDir(root: string): { manifest: string; digest: string } {
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const ent of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, ent.name);
+      if (ent.isDirectory()) walk(p);
+      else if (ent.isFile()) files.push(relative(root, p).split(sep).join('/'));
+    }
+  };
+  walk(root);
+  files.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  const manifest = files
+    .map(f => `${createHash('sha256').update(readFileSync(join(root, f))).digest('hex')}  ${f}\n`)
+    .join('');
+  return { manifest, digest: 'sha256:' + createHash('sha256').update(manifest, 'utf8').digest('hex') };
 }
 
 /** Resolve a deployment URL back to the deployment that owns it. */
