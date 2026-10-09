@@ -17,10 +17,13 @@
  * The gateway gates every tool here. Two properties matter and are easy to
  * lose:
  *
- *   1. `release` declares `receipt_id` in its schema. That declaration is what
- *      makes the gateway inject the receipt after minting it. Remove it and the
- *      pipeline has nothing to verify — the chain silently degrades to an
- *      unproven release.
+ *   1. `release` declares `ticket_id` in its schema (HAP v0.7 wire vocabulary —
+ *      was `receipt_id`). That declaration is what makes the gateway inject
+ *      the ticket after minting it. Remove it and the pipeline has nothing to
+ *      verify — the chain silently degrades to an unproven release. The value
+ *      is forwarded to the release workflow as its `receipt_id` input — that
+ *      downstream GitHub Actions input name is unchanged (it lives in a
+ *      different repo's workflow file, out of scope for this rename).
  *   2. The token is read from the environment, never from an argument. An agent
  *      that could supply its own credential would have routed around the point.
  */
@@ -30,7 +33,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import * as gh from './github-api.js';
 
-const server = new McpServer({ name: 'deploy-mcp', version: '0.2.0' });
+// Exported so tests can register a linked in-memory transport without
+// starting the real stdio server (see "Start" below).
+export const server = new McpServer({ name: 'deploy-mcp', version: '0.2.0' });
 
 const fail = (e: unknown) => ({
   content: [{ type: 'text' as const, text: `Error: ${(e as Error).message}` }],
@@ -214,18 +219,18 @@ server.tool(
       .string()
       .optional()
       .describe('Branch the pipeline is dispatched on (default "main"). Nothing is built from it — the release activates deployment_url.'),
-    // Declared so the gateway injects the minted receipt. Not supplied by the
+    // Declared so the gateway injects the minted ticket. Not supplied by the
     // agent — anything it passes is overwritten by the real one.
-    receipt_id: z.string().optional().describe('Injected by the gateway after the receipt is issued'),
+    ticket_id: z.string().optional().describe('Injected by the gateway after the ticket is issued'),
   },
-  async ({ repo, workflow, environment, deployment_url, commit, branch, receipt_id }) => {
+  async ({ repo, workflow, environment, deployment_url, commit, branch, ticket_id }) => {
     try {
-      if (!receipt_id) {
+      if (!ticket_id) {
         // Ungated call, or the schema declaration was lost in a refactor.
         // Refuse rather than release something the pipeline cannot verify.
         return fail(new Error(
-          'No receipt_id was supplied. This tool must be called through a Suveren gateway, ' +
-          'which injects the receipt after authorising the release. Nothing was dispatched.',
+          'No ticket_id was supplied. This tool must be called through a Suveren gateway, ' +
+          'which injects the ticket after authorising the release. Nothing was dispatched.',
         ));
       }
       if (!/^https:\/\/[^\s]+$/.test(deployment_url)) {
@@ -299,14 +304,16 @@ server.tool(
         // `artifact_commit` is the commit whose committed files ARE the build;
         // the pipeline's verify job checks it out, hashes website/dist, and
         // verifies the build attestation over that digest.
-        inputs: { deployment_url, receipt_id, environment, commit, artifact_commit: deployment.sha },
+        // The downstream workflow_dispatch input is still named `receipt_id`
+        // (that YAML lives in a different repo, out of scope for this rename).
+        inputs: { deployment_url, receipt_id: ticket_id, environment, commit, artifact_commit: deployment.sha },
       });
 
       const run = await gh.findRunSince(repo, workflow, dispatchedAt);
       const where = run ? `\nRun ${run.id}: ${run.html_url}` : '\nRun id not yet visible.';
       return ok(
         `Releasing ${deployment_url} to ${environment}.${where}\n` +
-        `The pipeline verifies receipt ${receipt_id} binds commit ${commit.slice(0, 7)}, and that this build came from it, before serving anything.`,
+        `The pipeline verifies ticket ${ticket_id} binds commit ${commit.slice(0, 7)}, and that this build came from it, before serving anything.`,
       );
     } catch (e) {
       return fail(e);
@@ -316,6 +323,11 @@ server.tool(
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error('[deploy-mcp] ready');
+// Guarded so importing this module (e.g. from a test, to reach `server` or
+// trigger tool registration) never starts a real stdio server as a side
+// effect of import.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('[deploy-mcp] ready');
+}
