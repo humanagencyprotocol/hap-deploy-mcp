@@ -45,10 +45,14 @@ never authors or builds anything.
 
 ## Two properties that are easy to lose
 
-**1. `release` declares `receipt_id`.** That declaration is what makes a Suveren
-gateway inject the receipt it just minted. Remove it and the pipeline has
-nothing to verify — the chain quietly degrades to an unproven release. The tool
-refuses to dispatch when the field is missing, so the failure is loud.
+**1. `release` declares `ticket_id`** (HAP v0.7 wire vocabulary — was
+`receipt_id`). That declaration is what makes a Suveren gateway inject the
+ticket it just minted. Remove it and the pipeline has nothing to verify — the
+chain quietly degrades to an unproven release. The tool refuses to dispatch
+when the field is missing, so the failure is loud. `release` forwards the
+value to the downstream GitHub Actions workflow as that workflow's
+`receipt_id` input — the workflow's input name is unchanged (it lives in a
+different repository, out of scope for this rename).
 
 **2. A build URL is required, not a commit or branch.** `release` rejects
 anything that is not a URL. The receipt binds that exact build — the same bytes
