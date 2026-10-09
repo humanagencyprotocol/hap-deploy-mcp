@@ -44,6 +44,10 @@ jobs:
       - name: Build
         run: npm run build
 
+      # The release guard is this connector's safety; never publish untested.
+      - name: Test
+        run: npm test
+
       - name: Publish to npm
         # Trusted Publishing via OIDC — no NPM_TOKEN secret. Requires a Trusted
         # Publisher configured for @humanagencyp/deploy-mcp on npmjs.com
