@@ -31,6 +31,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import * as gh from './github-api.js';
 
 // Exported so tests can register a linked in-memory transport without
@@ -326,7 +328,20 @@ server.tool(
 // Guarded so importing this module (e.g. from a test, to reach `server` or
 // trigger tool registration) never starts a real stdio server as a side
 // effect of import.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Compare REAL paths: the gateway starts this through its package bin, a
+// symlink in node_modules/.bin, so argv[1] is the link — a plain string
+// comparison never matched there and the process exited silently (0.5.0).
+function isEntryPoint(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('[deploy-mcp] ready');
