@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- Fix: start when launched through the package bin symlink. 0.5.0 compared `import.meta.url` with `file://${argv[1]}`; under `node_modules/.bin` (how the Suveren gateway starts connectors) that never matched and the process exited silently, so Deploy (GitHub) could not start ("Connection closed").
+
 ## 0.5.0
 
 **BREAKING:** the tool argument `receipt_id` is now `ticket_id` (HAP v0.7
