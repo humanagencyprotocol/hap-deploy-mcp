@@ -3,12 +3,12 @@
 Deploy MCP server — make already-built software live, under bounded human authority.
 
 Implements the executor side of the [Human Agency Protocol](https://humanagencyprotocol.org)
-`deploy@0.7` profile. Backend: **GitHub Actions**.
+`deploy@0.12` profile. Backend: **GitHub Actions**.
 
 ## What it does
 
 Exposes releasing as gated tools so an agent can put software in front of real
-users **only** with a signed receipt behind it. It does not decide whether a
+users **only** with a signed ticket behind it. It does not decide whether a
 release is allowed — that is the Gatekeeper's job, and then the pipeline's.
 
 **The gated action is a release, not a build.** Building harms nobody: a preview
@@ -29,7 +29,7 @@ approved.
 
 ```
 GITHUB_TOKEN=<fine-grained token>
-HAP_DEPLOY_ARTIFACT_PATH=website/dist   # optional — see "What the receipt binds"
+HAP_DEPLOY_ARTIFACT_PATH=website/dist   # optional — see "What the ticket binds"
 ```
 
 Fine-grained, scoped to **one repository**:
@@ -55,7 +55,7 @@ value to the downstream GitHub Actions workflow as that workflow's
 different repository, out of scope for this rename).
 
 **2. A build URL is required, not a commit or branch.** `release` rejects
-anything that is not a URL. The receipt binds that exact build — the same bytes
+anything that is not a URL. The ticket binds that exact build — the same bytes
 a human inspected. Call `list_deployments` first.
 
 Deployment URLs come from GitHub's Deployments API, which hosts with a GitHub
@@ -64,9 +64,9 @@ server never needs the host's credentials** — GitHub already knows the address
 and that one value identifies the artifact, shows the human what they are
 approving, and is what the host's promote command accepts.
 
-## What the receipt binds, and how the release checks it
+## What the ticket binds, and how the release checks it
 
-The receipt binds the **source commit** the build came from — the value the
+The ticket binds the **source commit** the build came from — the value the
 released page shows in its footer, so a reader can tie the page to an approval
 without any account. GitHub's Deployments API reports only the *trigger* sha,
 and for a repository that commits its built artifact those differ: the trigger
